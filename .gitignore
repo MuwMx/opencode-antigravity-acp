@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.*
+coverage/
+# Keep dist/gui-experimental.cjs tracked so OpenCode loads the prebuilt GUI bundle without a build step.

@@ -1,0 +1,55 @@
+{
+  "name": "opencode-antigravity-acp",
+  "version": "0.1.0",
+  "description": "Use your Antigravity subscription models in OpenCode via the official agy acp protocol, with Code Mode, MCP tools, skills, AGENTS.md, and cross-model context handoff.",
+  "author": "system1970",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/system1970/opencode-antigravity-acp.git"
+  },
+  "homepage": "https://github.com/system1970/opencode-antigravity-acp#readme",
+  "bugs": {
+    "url": "https://github.com/system1970/opencode-antigravity-acp/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "antigravity",
+    "acp",
+    "agent-client-protocol",
+    "mcp",
+    "codemode"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./rpc": "./src/rpc.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "vite build",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.3.2",
+    "effect": "^4.1.0"
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "^3.0.0",
+    "@opencode/plugin": "2.3.2",
+    "@types/node": "^22.0.0",
+    "effect": "4.1.0",
+    "solid-js": "^1.9.0",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0",
+    "vite-plugin-solid": "^2.11.0"
+  }
+}
