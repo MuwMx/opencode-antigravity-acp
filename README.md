@@ -1,5 +1,6 @@
 # opencode-antigravity-acp
 
+[![npm](https://img.shields.io/npm/v/opencode-antigravity-acp.svg)](https://www.npmjs.com/package/opencode-antigravity-acp)
 [![CI](https://github.com/system1970/opencode-antigravity-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/system1970/opencode-antigravity-acp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
@@ -68,9 +69,11 @@ This plugin follows the same official-harness architecture used by tools like **
 ### Option 1: Install via OpenCode CLI (Recommended)
 
 ```bash
-opencode plugin add github:system1970/opencode-antigravity-acp
+opencode plugin add opencode-antigravity-acp
 opencode service restart
 ```
+
+*(You can also install directly from GitHub via `opencode plugin add github:system1970/opencode-antigravity-acp`.)*
 
 ### Option 2: Clone into OpenCode's Auto-Discovered Plugin Folder
 
