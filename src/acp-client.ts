@@ -372,6 +372,74 @@ interface PendingRpc {
   readonly timer?: ReturnType<typeof setTimeout>
 }
 
+export type AcpAuthMethodId =
+  | "oauth-personal"
+  | "oauth-business"
+  | "gemini-api-key"
+  | "agent-platform"
+
+const KNOWN_AUTH_METHODS: readonly string[] = [
+  "oauth-personal",
+  "oauth-business",
+  "gemini-api-key",
+  "agent-platform",
+]
+
+/**
+ * Resolves which ACP auth method to use.
+ * Explicit `ANTIGRAVITY_ACP_AUTH_METHOD` wins; otherwise `GEMINI_API_KEY`
+ * selects `gemini-api-key`; otherwise thin consumer default `oauth-personal`.
+ */
+export function resolveAcpAuthMethod(env: NodeJS.ProcessEnv = process.env): AcpAuthMethodId {
+  const override = env.ANTIGRAVITY_ACP_AUTH_METHOD?.trim()
+  if (override && (KNOWN_AUTH_METHODS as readonly string[]).includes(override)) {
+    return override as AcpAuthMethodId
+  }
+  if (env.GEMINI_API_KEY?.trim()) return "gemini-api-key"
+  return "oauth-personal"
+}
+
+export interface AcpAuthenticateParams {
+  readonly methodId?: string
+  readonly apiKey?: string
+}
+
+const OAUTH_COLLIDING_ENV_KEYS = [
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+] as const
+
+/**
+ * Builds the child-process env for spawning `agy acp`.
+ * When the effective auth method is an OAuth browser flow (`oauth-personal`
+ * or `oauth-business`), ambient `GEMINI_API_KEY` / `GOOGLE_API_KEY` /
+ * `GOOGLE_APPLICATION_CREDENTIALS` are scrubbed so stray keys never collide
+ * with the OAuth login. Kept when `gemini-api-key` or `agent-platform` is selected.
+ * On Windows the match is case-insensitive (env vars are case-insensitive
+ * there); exact match everywhere else.
+ */
+export function buildAgySpawnEnv(
+  source: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...source }
+  const method = resolveAcpAuthMethod(source)
+  if (method === "oauth-personal" || method === "oauth-business") {
+    if (platform === "win32") {
+      const doomed = new Set(OAUTH_COLLIDING_ENV_KEYS.map((k) => k.toLowerCase()))
+      for (const key of Object.keys(env)) {
+        if (doomed.has(key.toLowerCase())) delete env[key]
+      }
+    } else {
+      for (const key of OAUTH_COLLIDING_ENV_KEYS) {
+        delete env[key]
+      }
+    }
+  }
+  return env
+}
+
 export class AcpProcess {
   private proc: ChildProcessWithoutNullStreams
   private nextId = 1
@@ -394,7 +462,7 @@ export class AcpProcess {
     this.proc = spawn(binary, args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      env: buildAgySpawnEnv(),
     })
 
     this.proc.stdout.on("data", (chunk: Buffer) => {
@@ -561,7 +629,7 @@ export class AcpProcess {
       {
         protocolVersion: 1,
         clientCapabilities: {},
-        clientInfo: { name: "acp-bridge", version: "0.1.0" },
+        clientInfo: { name: "acp-bridge", version: "0.2.0" },
       },
       15_000,
     )
@@ -570,20 +638,10 @@ export class AcpProcess {
   newSession(params: {
     readonly cwd: string
     readonly mcpServers?: readonly AcpMcpServerHttp[]
-    readonly appendSystemPrompt?: string
   }): Promise<any> {
     const payload: any = {
       cwd: params.cwd,
       mcpServers: params.mcpServers ? [...params.mcpServers] : [],
-    }
-    if (params.appendSystemPrompt && params.appendSystemPrompt.trim().length > 0) {
-      payload._meta = {
-        antigravity: {
-          systemPrompt: {
-            append: params.appendSystemPrompt,
-          },
-        },
-      }
     }
     return this.request("session/new", payload, 30_000)
   }
@@ -592,21 +650,11 @@ export class AcpProcess {
     readonly sessionId: string
     readonly cwd: string
     readonly mcpServers?: readonly AcpMcpServerHttp[]
-    readonly appendSystemPrompt?: string
   }): Promise<any> {
     const payload: any = {
       sessionId: params.sessionId,
       cwd: params.cwd,
       mcpServers: params.mcpServers ? [...params.mcpServers] : [],
-    }
-    if (params.appendSystemPrompt && params.appendSystemPrompt.trim().length > 0) {
-      payload._meta = {
-        antigravity: {
-          systemPrompt: {
-            append: params.appendSystemPrompt,
-          },
-        },
-      }
     }
     return this.request("session/resume", payload, 20_000)
   }
@@ -621,6 +669,43 @@ export class AcpProcess {
 
   setConfigOption(sessionId: string, configId: string, value: string): Promise<any> {
     return this.request("session/set_config_option", { sessionId, configId, value }, 10_000)
+  }
+
+  /**
+   * Explicit ACP authentication against the local `agy acp` server.
+   * Uses the official `authenticate` method with `{ methodId }`:
+   * explicit `ANTIGRAVITY_ACP_AUTH_METHOD` wins, else `GEMINI_API_KEY`
+   * selects `gemini-api-key`, else thin consumer default `oauth-personal`.
+   * Benign already-authenticated errors resolve `undefined` so cached/env
+   * auth keeps working seamlessly. Unknown servers resolve `undefined`.
+   */
+  async authenticate(params?: AcpAuthenticateParams): Promise<any | undefined> {
+    const rawMethod = params?.methodId
+    const methodId =
+      rawMethod && (KNOWN_AUTH_METHODS as readonly string[]).includes(rawMethod)
+        ? rawMethod
+        : resolveAcpAuthMethod()
+    if (
+      methodId === "gemini-api-key" &&
+      !process.env.GEMINI_API_KEY?.trim() &&
+      !params?.apiKey?.trim()
+    ) {
+      throw new Error(
+        'ACP auth method "gemini-api-key" requires GEMINI_API_KEY to be set (or pass apiKey). Set GEMINI_API_KEY or choose another method via ANTIGRAVITY_ACP_AUTH_METHOD (oauth-personal | oauth-business | gemini-api-key | agent-platform).',
+      )
+    }
+    const payload: any = { methodId }
+    if (params?.apiKey) {
+      payload._meta = { apiKey: params.apiKey }
+    }
+    try {
+      return await this.request("authenticate", payload, 10_000)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (/Method not found|Unsupported client method|-32601/.test(msg)) return undefined
+      if (/already (authenticated|logged in|signed in)/i.test(msg)) return undefined
+      throw err
+    }
   }
 
   prompt(sessionId: string, prompt: readonly AcpContentBlock[]): Promise<AcpPromptResult> {

@@ -229,13 +229,17 @@ function formatToolResultOutput(output: LanguageModelV3ToolResultOutput): {
 
 function hasAcpMarker(msg: LanguageModelV3Prompt[number]): boolean {
   if (msg.role !== "assistant") return false
-  if (msg.providerOptions && ACP_PROVIDER_ID in msg.providerOptions) return true
-  return msg.content.some(
-    (part) =>
-      "providerOptions" in part &&
-      part.providerOptions !== undefined &&
-      ACP_PROVIDER_ID in part.providerOptions,
-  )
+  const msgOpts = (msg as any).providerOptions
+  if (msgOpts && ACP_PROVIDER_ID in msgOpts) return true
+  const msgMeta = (msg as any).providerMetadata
+  if (msgMeta && ACP_PROVIDER_ID in msgMeta) return true
+  return (msg.content as any[]).some((part) => {
+    if (!part || typeof part !== "object") return false
+    const partOpts = (part as any).providerOptions
+    if (partOpts && ACP_PROVIDER_ID in partOpts) return true
+    const partMeta = (part as any).providerMetadata
+    return !!(partMeta && ACP_PROVIDER_ID in partMeta)
+  })
 }
 
 function formatMessageForCatchUp(msg: LanguageModelV3Prompt[number]): string {
@@ -264,15 +268,88 @@ function fileDataToBase64(data: Uint8Array | string | URL): string | undefined {
     return Buffer.from(data).toString("base64")
   }
   if (typeof data === "string") {
-    const match = /^data:[^;]+;base64,(.*)$/s.exec(data)
-    return match ? match[1] : data
+    // data: URIs carry inline base64 after the marker. The wrapper regex alone
+    // is not trusted: the captured payload must itself be valid non-empty
+    // base64 (no whitespace, padded length, base64 alphabet only).
+    if (data.startsWith("data:")) {
+      const match = /^data:[^;]+;base64,(.*)$/s.exec(data)
+      if (!match) return undefined
+      const payload = match[1]
+      if (!payload || payload.length === 0) return undefined
+      if (/\s/.test(payload)) return undefined
+      if (payload.length % 4 !== 0) return undefined
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(payload)) return undefined
+      return payload
+    }
+    // Raw inline base64 is also accepted (no URL/path/whitespace, valid
+    // alphabet, padded length). Anything else — URLs, filesystem paths,
+    // plain strings, refs — falls back to an "[Attached file]" placeholder
+    // and is never sent as image bytes.
+    if (isInlineBase64(data)) return data
+    return undefined
   }
   return undefined
 }
 
 /**
- * Extracts only the turns that Antigravity has not yet seen inside its stateful ACP session
- * (any intermediate turns produced by other OpenCode models, plus the latest user message).
+ * Conservative inline-base64 test: standard alphabet only, padded length, a
+ * minimum size so short ids/tokens never masquerade as images, and no URL,
+ * scheme, or whitespace markers anywhere in the string.
+ *
+ * Real base64-encoded JPEGs start with `/9j/` — a leading `/` alone must NOT
+ * reject them. Only known filesystem path prefixes (`/tmp/`, `/var/`,
+ * `/home/`, `/Users/`, `/etc/`, `/usr/`, `/opt/`, `./`, `../`, `~/`) plus
+ * backslashes still reject; everything else starting with `/` that matches
+ * the base64 alphabet is accepted as inline image bytes.
+ */
+const KNOWN_PATH_PREFIXES = [
+  "/tmp/",
+  "/var/",
+  "/home/",
+  "/Users/",
+  "/etc/",
+  "/usr/",
+  "/opt/",
+  "./",
+  "../",
+  "~/",
+] as const
+
+function isInlineBase64(data: string): boolean {
+  if (data.length < 32 || data.length % 4 !== 0) return false
+  if (/\s/.test(data)) return false
+  if (data.includes("://")) return false
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(data)) return false
+  if (data.includes("\\")) return false
+  for (const prefix of KNOWN_PATH_PREFIXES) {
+    if (data.startsWith(prefix)) return false
+  }
+  // Unix-path-shaped strings like `/workspace/assets/screenshots/abcdef` use
+  // only path-safe chars and slashes but are not image bytes. A leading `/`
+  // with 2+ path-like segments (`[A-Za-z0-9_.-]+`) and no base64-only markers
+  // (`=` padding or `+`) is rejected — except real JPEG base64, which starts
+  // with `/9j/` and must keep working.
+  if (data.startsWith("/") && !data.startsWith("/9j/")) {
+    const rest = data.slice(1)
+    if (rest.includes("/")) {
+      const segments = data.split("/").filter(Boolean)
+      if (
+        segments.length >= 2 &&
+        segments.every((seg) => /^[A-Za-z0-9_.\-]+$/.test(seg)) &&
+        !/[+=]/.test(data)
+      ) {
+        return false
+      }
+    }
+  }
+  return /^[A-Za-z0-9+/]*={0,2}$/.test(data)
+}
+
+/**
+ * Legacy cross-model catch-up builder (pre-Thin mode).
+ * @deprecated Strict Thin ACP Mode must use {@link buildThinAcpPromptBlocks} —
+ * non-ACP turns are never replayed upstream (see `hasNonAcpAssistantHistory`).
+ * Kept only for backward compatibility; not used by the bridge.
  */
 export function buildAcpPromptBlocks(
   prompt: LanguageModelV3Prompt,
@@ -315,6 +392,229 @@ export function buildAcpPromptBlocks(
     blocks.push({
       type: "text",
       text: `<conversation_context_from_other_models>\n${catchUpLines.join("\n\n")}\n</conversation_context_from_other_models>\n`,
+    })
+  }
+
+  if (currentUserMsg && currentUserMsg.role === "user") {
+    for (const part of currentUserMsg.content) {
+      if (part.type === "text") {
+        if (part.text.length > 0) {
+          blocks.push({ type: "text", text: part.text })
+        }
+      } else if (part.type === "file") {
+        const b64 = fileDataToBase64(part.data)
+        if (part.mediaType.startsWith("image/") && b64) {
+          blocks.push({ type: "image", data: b64, mimeType: part.mediaType })
+        } else {
+          blocks.push({
+            type: "text",
+            text: `[Attached file: ${part.filename ?? "file"} (${part.mediaType})]`,
+          })
+        }
+      }
+    }
+  }
+
+  if (blocks.length === 0) {
+    blocks.push({ type: "text", text: "Continue." })
+  }
+  return blocks
+}
+
+/**
+ * Thin-client prompt builder (ToS-compliant).
+ * Sends ONLY the raw latest human prompt to `agy acp` with zero injected
+ * OpenCode system prompt, zero `<workspace_tools_bridge>` preamble, and zero
+ * OpenCode tool/skill serialization. Antigravity owns its own session history
+ * via `session/new` / `session/resume` — never replay non-ACP turns.
+ */
+export function buildThinAcpPromptBlocks(prompt: LanguageModelV3Prompt): AcpContentBlock[] {
+  const nonSystem = prompt.filter((m) => m.role !== "system")
+  if (nonSystem.length === 0) {
+    return [{ type: "text", text: "Continue." }]
+  }
+  // Latest human user message is the only turn trigger.
+  let lastUserIdx = nonSystem.length - 1
+  while (lastUserIdx >= 0 && nonSystem[lastUserIdx].role !== "user") {
+    lastUserIdx--
+  }
+  const currentUserMsg = lastUserIdx >= 0 ? nonSystem[lastUserIdx] : undefined
+  const blocks: AcpContentBlock[] = []
+  if (currentUserMsg && currentUserMsg.role === "user") {
+    for (const part of currentUserMsg.content) {
+      if (part.type === "text") {
+        if (part.text.length > 0) {
+          blocks.push({ type: "text", text: part.text })
+        }
+      } else if (part.type === "file") {
+        const b64 = fileDataToBase64(part.data)
+        if (part.mediaType.startsWith("image/") && b64) {
+          blocks.push({ type: "image", data: b64, mimeType: part.mediaType })
+        } else {
+          blocks.push({
+            type: "text",
+            text: `[Attached file: ${part.filename ?? "file"} (${part.mediaType})]`,
+          })
+        }
+      }
+    }
+  }
+  if (blocks.length === 0) {
+    blocks.push({ type: "text", text: "Continue." })
+  }
+  return blocks
+}
+
+/**
+ * Detects OpenCode session history produced by non-ACP models.
+ * In Thin ACP Mode Antigravity owns its own session history, so a thread that
+ * already contains non-ACP assistant turns must not be replayed into `agy acp`
+ * — the user should start a fresh session or run `/agy-reset`.
+ */
+export function hasNonAcpAssistantHistory(prompt: LanguageModelV3Prompt): boolean {
+  for (const msg of prompt) {
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue
+    if (msg.content.length === 0) continue
+    if (!hasAcpMarker(msg)) return true
+  }
+  return false
+}
+
+/**
+ * Local plugin status/cooldown replies (circuit-open, restart-skip, missing
+ * CLI) are emitted by `createImmediateTextStream` with a
+ * `{ [ACP_PROVIDER_ID]: { localStatus: true } }` marker. They are neither ACP
+ * turns nor foreign model turns and must be skipped when scanning history.
+ */
+export function isLocalStatusMessage(msg: LanguageModelV3Prompt[number]): boolean {
+  const check = (holder: any): boolean => {
+    if (!holder || typeof holder !== "object") return false
+    const meta = holder.providerMetadata?.[ACP_PROVIDER_ID] ?? holder.providerOptions?.[ACP_PROVIDER_ID]
+    return !!meta && typeof meta === "object" && (meta as any).localStatus === true
+  }
+  if (check(msg)) return true
+  if (check((msg as any).providerOptions)) return true
+  if (check((msg as any).providerMetadata)) return true
+  const content = (msg as any).content
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue
+      if (check(part)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * T3-Code-style `create_with_handoff` detector.
+ * Returns true only when there are UNSEEN non-ACP assistant turns since the
+ * last ACP turn (i.e. the user switched to a normal model and back).
+ * Normal ACP-to-ACP flow (only ACP assistant turns + latest user) returns false.
+ *
+ * Local plugin status replies (`localStatus: true`) are skipped entirely:
+ * they are neither a completed ACP handoff checkpoint nor a foreign model turn.
+ */
+export function hasUnseenNonAcpAssistantHistory(prompt: LanguageModelV3Prompt): boolean {
+  const nonSystem = prompt.filter((m) => m.role !== "system")
+  if (nonSystem.length === 0) return false
+  let lastAcpIdx = -1
+  for (let i = nonSystem.length - 1; i >= 0; i--) {
+    const msg = nonSystem[i] as any
+    if (isLocalStatusMessage(msg)) continue
+    if (hasAcpMarker(nonSystem[i])) {
+      lastAcpIdx = i
+      break
+    }
+  }
+  const unseen = nonSystem.slice(lastAcpIdx + 1)
+  for (const msg of unseen) {
+    if (isLocalStatusMessage(msg as any)) continue
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue
+    if (msg.content.length === 0) continue
+    if (!hasAcpMarker(msg)) return true
+  }
+  return false
+}
+
+export const TEXT_ONLY_HANDOFF_HEADER =
+  "Historical conversation context (plain text only; not a new request; native tool/reasoning state is not replayed):"
+
+/** Appended when a single over-budget history line must be cut to fit. */
+const HANDOFF_TRUNCATION_MARKER = "\n... [truncated]"
+
+function extractHistoryText(msg: LanguageModelV3Prompt[number]): string {
+  const chunks: string[] = []
+  for (const part of msg.content) {
+    if (!part || typeof part !== "object") continue
+    if (part.type === "text" && typeof (part as any).text === "string" && (part as any).text.trim()) {
+      chunks.push((part as any).text.trim())
+    }
+    // Deliberately dropped: file, image, tool-call, tool-result, reasoning,
+    // and any other non-text parts (no tool/reasoning replay, no attachments).
+  }
+  return chunks.join("\n").trim()
+}
+
+/**
+ * T3-Code-style `create_with_handoff` prompt builder (v0.2.0).
+ * Plain-text-only handoff: ONLY `[Historical user]` / `[Historical assistant]`
+ * text turns (capped at `maxChars`, default 16,000), dropping all reasoning,
+ * tool calls, tool results, schemas, todos, and approvals — followed by the
+ * latest raw user prompt + attachments. Zero `<workspace_tools_bridge>`,
+ * zero OpenCode system prompt, zero tool schema injection.
+ */
+export function buildTextOnlyHandoffPromptBlocks(
+  prompt: LanguageModelV3Prompt,
+  options?: { readonly maxChars?: number },
+): AcpContentBlock[] {
+  const maxChars = options?.maxChars ?? 16_000
+  const nonSystem = prompt.filter((m) => m.role !== "system")
+  if (nonSystem.length === 0) {
+    return [{ type: "text", text: "Continue." }]
+  }
+  let lastUserIdx = nonSystem.length - 1
+  while (lastUserIdx >= 0 && nonSystem[lastUserIdx].role !== "user") {
+    lastUserIdx--
+  }
+  const currentUserMsg = lastUserIdx >= 0 ? nonSystem[lastUserIdx] : undefined
+  const priorMsgs = lastUserIdx > 0 ? nonSystem.slice(0, lastUserIdx) : []
+
+  const lines: string[] = []
+  for (const msg of priorMsgs) {
+    if (msg.role !== "user" && msg.role !== "assistant") continue
+    // Local plugin status/cooldown notices are harness output, not conversation
+    // history — never send them upstream as `[Historical assistant]` lines.
+    if (isLocalStatusMessage(msg as any)) continue
+    const text = extractHistoryText(msg)
+    if (!text) continue
+    lines.push(msg.role === "user" ? `[Historical user]: ${text}` : `[Historical assistant]: ${text}`)
+  }
+
+  // Newest-first budget: drop oldest lines first so the most recent context survives.
+  // The header line is framing overhead reserved up front (the "\n\n"
+  // separators and trailing newline are already counted by the +2 per line
+  // below), so the entire historical block (excluding the latest user prompt)
+  // never exceeds maxChars. The truncation marker length is reserved too.
+  const framingOverhead = TEXT_ONLY_HANDOFF_HEADER.length
+  const budget = Math.max(0, maxChars - framingOverhead)
+  let total = lines.reduce((sum, l) => sum + l.length + 2, 0)
+  while (lines.length > 1 && total > budget) {
+    const dropped = lines.shift()!
+    total -= dropped.length + 2
+  }
+  if (lines.length === 1 && lines[0].length + 2 > budget) {
+    if (budget <= HANDOFF_TRUNCATION_MARKER.length + 2) {
+      lines.length = 0
+    } else {
+      lines[0] = `${lines[0].slice(0, budget - HANDOFF_TRUNCATION_MARKER.length - 2)}${HANDOFF_TRUNCATION_MARKER}`
+    }
+  }
+
+  const blocks: AcpContentBlock[] = []
+  if (lines.length > 0) {
+    blocks.push({
+      type: "text",
+      text: `${TEXT_ONLY_HANDOFF_HEADER}\n${lines.join("\n\n")}\n`,
     })
   }
 

@@ -3,7 +3,6 @@ import { Effect, Stream } from "effect"
 import type { AcpDiscoveredModel } from "./acp-client.js"
 import {
   ACP_PROVIDER_ID,
-  extractSafeAcpContext,
   sanitizeForAcpModel,
   sanitizeForNonAcpModel,
 } from "./history-sanitizer.js"
@@ -102,17 +101,21 @@ export default Plugin.define({
         { providerID: ACP_PROVIDER_ID as any },
       )
 
-      // Capture live OpenCode instructions/tools for ACP AND isolate cross-model history formats
+      // Strict Thin ACP Mode: zero outer-harness prompt/tool injection.
+      // Snapshot the live tool catalog for the optional Code Mode MCP relay,
+      // then clear outer system instructions AND tool schemas so OpenCode
+      // does not inject anything into the ACP model call.
       yield* ctx.session.hook("context", (input) =>
         Effect.sync(() => {
           if (input.model.providerID === ACP_PROVIDER_ID) {
             sanitizeForAcpModel(input.messages as any[])
-            const systemText = extractSafeAcpContext(input.system)
             bridge.updateContextSnapshot(input.sessionID, {
-              systemText,
+              systemText: "",
               agent: input.agent,
               tools: input.tools,
             })
+            input.system = []
+            input.tools = {}
           } else {
             sanitizeForNonAcpModel(input.messages as any[])
           }
@@ -156,16 +159,20 @@ export default Plugin.define({
           }
           return Effect.promise(() => bridge.setMode(sessionID, mode))
         },
-        setRelayAll: (input) => {
-          const { sessionID, relayAllTools } = input as {
+        setCodeMode: (input) => {
+          const { sessionID, codeModeEnabled } = input as {
             sessionID: string
-            relayAllTools: boolean
+            codeModeEnabled: boolean
           }
-          return Effect.promise(() => bridge.setRelayAll(sessionID, relayAllTools))
+          return Effect.promise(() => bridge.setCodeMode(sessionID, codeModeEnabled))
         },
         resetSession: (input) => {
           const { sessionID } = input as { sessionID: string }
           return Effect.promise(() => bridge.resetSession(sessionID))
+        },
+        warmSession: (input) => {
+          const { sessionID } = input as { sessionID?: string }
+          return Effect.promise(() => bridge.warmSession(sessionID))
         },
         reloadModels: () =>
           Effect.gen(function* () {

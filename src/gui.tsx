@@ -141,9 +141,6 @@ const css = `
   line-height: 16px;
   white-space: nowrap;
 }
-.agy-mono {
-  font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, monospace);
-}
 
 .agy-alert {
   display: flex;
@@ -307,7 +304,7 @@ const css = `
 
 .agy-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   padding-top: 8px;
   border-top: 0.5px solid var(--v2-border-border-muted, rgba(255, 255, 255, 0.08));
@@ -331,14 +328,15 @@ interface AcpRpcClient {
     input: { readonly sessionID: string; readonly mode: AcpMode },
     options?: RpcCallOptions,
   ): Promise<AcpSessionState>
-  setRelayAll(
+  setCodeMode(
     input: {
       readonly sessionID: string
-      readonly relayAllTools: boolean
+      readonly codeModeEnabled: boolean
     },
     options?: RpcCallOptions,
   ): Promise<AcpSessionState>
   resetSession(input: { readonly sessionID: string }, options?: RpcCallOptions): Promise<AcpSessionState>
+  warmSession(input: { readonly sessionID?: string }, options?: RpcCallOptions): Promise<AcpSessionState>
   reloadModels(
     input: Record<string, never>,
     options?: RpcCallOptions,
@@ -354,6 +352,22 @@ export default Plugin.define({
     const loaded = new Set<string>()
     const inFlight = new Set<string>()
     const failedAt = new Map<string, number>()
+    const warmedSessions = new Set<string>()
+    const startingPollTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    const startingPollAttempts = new Map<string, number>()
+    // Per-session request ordering: every state-changing RPC captures a
+    // generation at issue time; only the newest generation may install state.
+    // This stops an older getState arriving after a newer warm/setMode from
+    // overwriting Starting/Connected with stale Standby.
+    const requestGen = new Map<string, number>()
+    const appliedGen = new Map<string, number>()
+    const fetchStatePromises = new Map<string, Promise<void>>()
+
+    const nextGen = (sessionID: string): number => {
+      const g = (requestGen.get(sessionID) ?? 0) + 1
+      requestGen.set(sessionID, g)
+      return g
+    }
 
     const getSessionSignal = (sessionID: string) => {
       let entry = signals.get(sessionID)
@@ -369,26 +383,53 @@ export default Plugin.define({
       signal: ctx.signal,
     })
 
-    const updateSessionState = (sessionID: string, next: AcpSessionState) => {
-      const [, setState] = getSessionSignal(sessionID)
+    const updateSessionState = (sessionID: string, next: AcpSessionState, gen?: number) => {
+      if (gen !== undefined) {
+        const applied = appliedGen.get(sessionID) ?? 0
+        if (gen < applied) return
+        appliedGen.set(sessionID, gen)
+      } else {
+        appliedGen.set(sessionID, requestGen.get(sessionID) ?? 0)
+      }
+      const [readState, setState] = getSessionSignal(sessionID)
+      const prev = untrack(readState)
       loaded.add(sessionID)
       failedAt.delete(sessionID)
       setState(next)
+      if (prev?.starting && !next.starting && !next.connected) {
+        // A previously-starting session settled without connecting (warm failed
+        // quietly or the proc died on arrival): clear the warm marker so a
+        // later selection retries instead of pinning the miss forever.
+        warmedSessions.delete(sessionID)
+      }
+      if (!next.starting) startingPollAttempts.delete(sessionID)
+      // Keep polling while the session is still starting so the pill animates
+      // Standby -> Starting... -> Connected even for slow cold spawns.
+      if (next.starting && !ctx.signal.aborted) {
+        // Directory is best-effort here; the poll's force-fetch works without it.
+        untrack(() => scheduleStartingPoll(sessionID, undefined))
+      }
     }
 
-    const fetchState = (sessionID: string, directory?: string, force = false) => {
-      if (!sessionID || ctx.signal.aborted) return
+    const fetchState = (
+      sessionID: string,
+      directory?: string,
+      force = false,
+    ): Promise<void> => {
+      if (!sessionID || ctx.signal.aborted) return Promise.resolve()
       if (!force) {
-        if (loaded.has(sessionID) || inFlight.has(sessionID)) return
+        if (loaded.has(sessionID) || inFlight.has(sessionID)) return Promise.resolve()
         const lastFail = failedAt.get(sessionID)
-        if (lastFail !== undefined && Date.now() - lastFail < ERROR_BACKOFF_MS) return
+        if (lastFail !== undefined && Date.now() - lastFail < ERROR_BACKOFF_MS)
+          return Promise.resolve()
       }
+      const gen = nextGen(sessionID)
       inFlight.add(sessionID)
-      void getRpc()
+      const p: Promise<void> = getRpc()
         .getState({ sessionID }, buildOpts(directory))
         .then((next: AcpSessionState) => {
           if (ctx.signal.aborted) return
-          updateSessionState(sessionID, next)
+          updateSessionState(sessionID, next, gen)
         })
         .catch(() => {
           failedAt.set(sessionID, Date.now())
@@ -396,6 +437,11 @@ export default Plugin.define({
         .finally(() => {
           inFlight.delete(sessionID)
         })
+      fetchStatePromises.set(sessionID, p)
+      void p.finally(() => {
+        if (fetchStatePromises.get(sessionID) === p) fetchStatePromises.delete(sessionID)
+      })
+      return p
     }
 
     const scheduleInitialFetch = (sessionID: string, directory?: string) => {
@@ -407,18 +453,80 @@ export default Plugin.define({
       })
     }
 
+    // Pre-warm `agy acp` the moment an Antigravity model is selected so the
+    // first turn doesn't pay a cold spawn. Server-side deduplicated; quiet on failure.
+    // Poll scheduling happens from the warm result, not the (necessarily stale)
+    // synchronous state read in show().
+    const warmAcpSession = (sessionID: string, directory?: string) => {
+      if (!sessionID || ctx.signal.aborted) return
+      if (warmedSessions.has(sessionID)) {
+        // An evicted/disconnected session may re-warm when reselected: a stale
+        // warm marker must not pin the miss forever.
+        const cur = untrack(() => getSessionSignal(sessionID)[0]())
+        if (cur?.connected || cur?.starting) return
+        warmedSessions.delete(sessionID)
+      }
+      warmedSessions.add(sessionID)
+      const gen = nextGen(sessionID)
+      void getRpc()
+        .warmSession({ sessionID }, buildOpts(directory))
+        .then((next: AcpSessionState) => {
+          if (ctx.signal.aborted) return
+          if (!next.starting && !next.connected) {
+            // Quiet no-op (circuit open / disposed): allow a later retry.
+            warmedSessions.delete(sessionID)
+          }
+          updateSessionState(sessionID, next, gen)
+        })
+        .catch(() => {
+          warmedSessions.delete(sessionID)
+        })
+    }
+
+    // While a session reports starting, re-fetch with backoff until it settles
+    // to Connected/Error (or the plugin unloads). Attempts reset on settle.
+    const scheduleStartingPoll = (sessionID: string, directory?: string) => {
+      if (!sessionID || ctx.signal.aborted || startingPollTimers.has(sessionID)) return
+      const attempts = startingPollAttempts.get(sessionID) ?? 0
+      startingPollAttempts.set(sessionID, attempts + 1)
+      const delay = Math.min(1500 * Math.pow(2, attempts), 12000)
+      startingPollTimers.set(
+        sessionID,
+        setTimeout(() => {
+          startingPollTimers.delete(sessionID)
+          if (ctx.signal.aborted) return
+          const cur = untrack(() => getSessionSignal(sessionID)[0]())
+          if (!cur?.starting) {
+            startingPollAttempts.delete(sessionID)
+            return
+          }
+          // Wait for the current fetchState promise to settle before
+          // scheduling the next poll so polls never overlap or reorder.
+          const run = () => fetchState(sessionID, directory, true)
+          const inFlightPoll = fetchStatePromises.get(sessionID)
+          const after: Promise<void> = inFlightPoll
+            ? inFlightPoll.then(run, run)
+            : run()
+          void after.finally(() => {
+            if (ctx.signal.aborted) return
+            const latest = untrack(() => getSessionSignal(sessionID)[0]())
+            if (latest?.starting) untrack(() => scheduleStartingPoll(sessionID, directory))
+          })
+        }, delay),
+      )
+    }
+
     function AcpControlsPopover(input: ComposerPillMenuProps) {
       const uid = createUniqueId()
       const [modeSaving, setModeSaving] = createSignal<AcpMode | null>(null)
-      const [relaySaving, setRelaySaving] = createSignal(false)
-      const [resetting, setResetting] = createSignal(false)
+      const [codeModeSaving, setCodeModeSaving] = createSignal(false)
       const [reloading, setReloading] = createSignal(false)
       const [actionError, setActionError] = createSignal<string | null>(null)
       const [now, setNow] = createSignal(Date.now())
 
       const sessionID = () => input.session.id
       const directory = () => input.session.directory
-      const state = () => untrack(() => getSessionSignal(sessionID()))[0]()
+      const state = () => getSessionSignal(sessionID())[0]()
 
       // Refresh live status each time the popover opens or navigates to another session
       createEffect(() => {
@@ -441,7 +549,7 @@ export default Plugin.define({
       })
 
       const activeMode = (): AcpMode => state()?.mode ?? "auto"
-      const relayAll = () => state()?.relayAllTools ?? false
+      const codeModeEnabled = () => state()?.codeModeEnabled ?? false
       const activeModeMeta = () => MODE_OPTIONS.find((m) => m.id === activeMode()) ?? MODE_OPTIONS[0]
 
       const cooldownSeconds = () => {
@@ -454,6 +562,7 @@ export default Plugin.define({
       const dotState = () => {
         const st = state()
         if (st?.busy) return "busy"
+        if (st?.starting) return "busy"
         if (cooldownSeconds() > 0) return "cooldown"
         if (st?.lastError) return "error"
         if (st?.connected) return "connected"
@@ -463,6 +572,7 @@ export default Plugin.define({
       const statusText = () => {
         const st = state()
         if (st?.busy) return "Running"
+        if (st?.starting) return "Starting..."
         const secs = cooldownSeconds()
         if (secs > 0) return `Cooldown · ${secs}s`
         if (st?.lastError) return "Error"
@@ -487,11 +597,11 @@ export default Plugin.define({
 
       const bridgeBadgeText = () => {
         const st = state()
-        if (!st) return "MCP + Skills"
-        if (st.relayAllTools) {
-          return st.relayedToolCount > 0 ? `All (${st.relayedToolCount})` : "All tools"
+        if (!st) return "Pure ACP"
+        if (st.codeModeEnabled) {
+          return st.relayedToolCount > 0 ? `Code Mode (${st.relayedToolCount})` : "Code Mode"
         }
-        return st.relayedToolCount > 0 ? `${st.relayedToolCount} bridged` : "MCP + Skills"
+        return "Pure ACP"
       }
 
       const selectMode = async (mode: AcpMode) => {
@@ -500,9 +610,10 @@ export default Plugin.define({
         const dir = directory()
         setActionError(null)
         setModeSaving(mode)
+        const gen = nextGen(sid)
         try {
           const next = await getRpc().setMode({ sessionID: sid, mode }, buildOpts(dir))
-          updateSessionState(sid, next)
+          updateSessionState(sid, next, gen)
         } catch (err) {
           setActionError(fmtErr(err))
         } finally {
@@ -510,61 +621,42 @@ export default Plugin.define({
         }
       }
 
-      const selectRelay = async (nextRelayAll: boolean) => {
-        if (relaySaving() || relayAll() === nextRelayAll) return
+      const selectCodeMode = async (nextCodeMode: boolean) => {
+        if (codeModeSaving() || codeModeEnabled() === nextCodeMode) return
         const sid = sessionID()
         const dir = directory()
         setActionError(null)
-        setRelaySaving(true)
+        setCodeModeSaving(true)
+        const gen = nextGen(sid)
         try {
-          const next = await getRpc().setRelayAll(
-            { sessionID: sid, relayAllTools: nextRelayAll },
+          const next = await getRpc().setCodeMode(
+            { sessionID: sid, codeModeEnabled: nextCodeMode },
             buildOpts(dir),
           )
-          updateSessionState(sid, next)
+          updateSessionState(sid, next, gen)
           ctx.toast.show({
-            title: "Tool bridge updated",
-            description: nextRelayAll
-              ? "Routing all OpenCode tools (incl. read/edit/bash)"
-              : "Using ACP native file/shell + bridged MCP & skills",
+            title: "ACP mode updated",
+            description: nextCodeMode
+              ? "Code Mode MCP attached (single 'oc' server, switching reconnects with a plain-text handoff of conversation context)"
+              : "Pure ACP — 100% native agy acp, zero bridged MCPs (switching reconnects with a plain-text handoff of conversation context)",
             variant: "success",
           })
         } catch (err) {
           setActionError(fmtErr(err))
         } finally {
-          setRelaySaving(false)
-        }
-      }
-
-      const handleReset = async () => {
-        if (resetting() || reloading()) return
-        const sid = sessionID()
-        const dir = directory()
-        setActionError(null)
-        setResetting(true)
-        try {
-          const next = await getRpc().resetSession({ sessionID: sid }, buildOpts(dir))
-          updateSessionState(sid, next)
-          ctx.toast.show({
-            title: "Antigravity ACP thread reset",
-            variant: "success",
-          })
-        } catch (err) {
-          setActionError(fmtErr(err))
-        } finally {
-          setResetting(false)
+          setCodeModeSaving(false)
         }
       }
 
       const handleReloadModels = async () => {
-        if (reloading() || resetting()) return
+        if (reloading()) return
         const sid = sessionID()
         const dir = directory()
         setActionError(null)
         setReloading(true)
         try {
           const res = await getRpc().reloadModels({}, buildOpts(dir))
-          fetchState(sid, dir, true)
+          void fetchState(sid, dir, true)
           ctx.toast.show({
             title: "Antigravity models refreshed",
             description: `${res.modelCount} models available`,
@@ -590,19 +682,7 @@ export default Plugin.define({
               <span class="agy-status-text">{statusText()}</span>
             </div>
             <div class="agy-meta-chips">
-              <Show
-                when={state()?.acpSessionId}
-                fallback={<span class="agy-chip">No thread</span>}
-              >
-                {(acpSid) => (
-                  <span class="agy-chip agy-mono" title={`ACP thread ${acpSid()}`}>
-                    #{acpSid().slice(0, 8)}
-                  </span>
-                )}
-              </Show>
-              <Show when={(state()?.relayedToolCount ?? 0) > 0}>
-                <span class="agy-chip">{state()!.relayedToolCount} tools</span>
-              </Show>
+              <span class="agy-chip">{bridgeBadgeText()}</span>
             </div>
           </div>
 
@@ -664,7 +744,7 @@ export default Plugin.define({
           <div class="agy-sec">
             <div class="agy-sec-head">
               <span id={bridgeHeadingId} class="agy-sec-title">
-                Tool bridge
+                ACP mode
               </span>
               <span class="agy-sec-badge">{bridgeBadgeText()}</span>
             </div>
@@ -672,34 +752,34 @@ export default Plugin.define({
               <button
                 type="button"
                 class="agy-bridge-btn"
-                aria-pressed={!relayAll()}
+                aria-pressed={!codeModeEnabled()}
                 aria-describedby={bridgeHintId}
-                disabled={relaySaving()}
-                onClick={() => void selectRelay(false)}
+                disabled={codeModeSaving()}
+                onClick={() => void selectCodeMode(false)}
               >
-                <Show when={relaySaving() && relayAll()}>
+                <Show when={codeModeSaving() && codeModeEnabled()}>
                   <ctx.ui.Loader size="small" />
                 </Show>
-                <span>Native + MCP</span>
+                <span>Pure ACP</span>
               </button>
               <button
                 type="button"
                 class="agy-bridge-btn"
-                aria-pressed={relayAll()}
+                aria-pressed={codeModeEnabled()}
                 aria-describedby={bridgeHintId}
-                disabled={relaySaving()}
-                onClick={() => void selectRelay(true)}
+                disabled={codeModeSaving()}
+                onClick={() => void selectCodeMode(true)}
               >
-                <Show when={relaySaving() && !relayAll()}>
+                <Show when={codeModeSaving() && !codeModeEnabled()}>
                   <ctx.ui.Loader size="small" />
                 </Show>
-                <span>All OpenCode</span>
+                <span>+ Code Mode</span>
               </button>
             </div>
             <p id={bridgeHintId} class="agy-hint">
-              {relayAll()
-                ? "Routes read, edit, bash, Code Mode, MCP & skills through OpenCode (resets thread on switch)."
-                : "ACP runs native file & shell; OpenCode bridges Code Mode, MCP & skills."}
+              {codeModeEnabled()
+                ? "Attaches only the single 'oc' Code Mode MCP server (zero prompt injection; switching reconnects with a plain-text handoff of conversation context)."
+                : "Pure ACP default: mcpServers [], zero bridged MCPs, 100% native agy acp (switching reconnects with a plain-text handoff of conversation context)."}
             </p>
           </div>
 
@@ -707,20 +787,8 @@ export default Plugin.define({
             <ctx.ui.Button
               size="small"
               variant="neutral"
-              icon="reset"
-              busy={resetting()}
-              disabled={reloading()}
-              class="agy-action-btn"
-              onClick={() => void handleReset()}
-            >
-              Reset thread
-            </ctx.ui.Button>
-            <ctx.ui.Button
-              size="small"
-              variant="neutral"
               icon="refresh"
               busy={reloading()}
-              disabled={resetting()}
               class="agy-action-btn"
               onClick={() => void handleReloadModels()}
             >
@@ -742,16 +810,25 @@ export default Plugin.define({
         const directory = input.session.directory
         const [readState] = untrack(() => getSessionSignal(sessionID))
         scheduleInitialFetch(sessionID, directory)
+        // Pre-warm `agy acp` on selection/mount and on session switches while
+        // an Antigravity model stays selected — pill goes Standby -> Starting... -> Connected.
+        untrack(() => warmAcpSession(sessionID, directory))
 
         const state = readState()
         const activeMode: AcpMode = state?.mode ?? "auto"
         const cooldownActive = Boolean(state?.cooldownUntil && state.cooldownUntil > Date.now())
+
+        if (state?.starting) {
+          untrack(() => scheduleStartingPoll(sessionID, directory))
+        }
 
         let label = `ACP · ${MODE_LABELS[activeMode]}`
         let tone: ComposerPillTone | undefined
         if (state?.busy) {
           label = `ACP · ${MODE_LABELS[activeMode]} · Running`
           tone = "success"
+        } else if (state?.starting) {
+          label = `ACP · ${MODE_LABELS[activeMode]} · Starting...`
         } else if (cooldownActive) {
           label = "ACP · Cooldown"
           tone = "warning"
@@ -790,12 +867,16 @@ export default Plugin.define({
         run: async () => {
           const target = currentSessionTarget()
           if (!target) return
+          // Capture the generation BEFORE the reset RPC: only this reset may
+          // install its result, so a late reset response cannot overwrite a
+          // newer setCodeMode update that landed mid-flight.
+          const gen = nextGen(target.sessionID)
           const next = await getRpc().resetSession(
             { sessionID: target.sessionID },
             buildOpts(target.directory),
           )
-          updateSessionState(target.sessionID, next)
-          ctx.toast.show({ title: "Antigravity ACP thread reset", variant: "success" })
+          updateSessionState(target.sessionID, next, gen)
+          ctx.toast.show({ title: "Antigravity ACP session reset", variant: "success" })
         },
       }),
     )
@@ -810,7 +891,7 @@ export default Plugin.define({
         run: async () => {
           const target = currentSessionTarget()
           const res = await getRpc().reloadModels({}, buildOpts(target?.directory))
-          if (target) fetchState(target.sessionID, target.directory, true)
+          if (target) void fetchState(target.sessionID, target.directory, true)
           ctx.toast.show({
             title: "Antigravity models refreshed",
             description: `${res.modelCount} models available`,
@@ -825,6 +906,13 @@ export default Plugin.define({
       loaded.clear()
       inFlight.clear()
       failedAt.clear()
+      warmedSessions.clear()
+      requestGen.clear()
+      appliedGen.clear()
+      fetchStatePromises.clear()
+      for (const t of startingPollTimers.values()) clearTimeout(t)
+      startingPollTimers.clear()
+      startingPollAttempts.clear()
     }
   },
 })

@@ -5,7 +5,8 @@ export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 export interface AcpSessionState {
   readonly sessionID: string
   readonly mode: AcpMode
-  readonly relayAllTools: boolean
+  readonly codeModeEnabled: boolean
+  readonly starting: boolean
   readonly acpSessionId: string | null
   readonly connected: boolean
   readonly busy: boolean
@@ -29,7 +30,8 @@ const stateSchema = {
   properties: {
     sessionID: { type: "string" },
     mode: { type: "string", enum: ["auto", "accept-edits", "default", "plan"] },
-    relayAllTools: { type: "boolean" },
+    codeModeEnabled: { type: "boolean" },
+    starting: { type: "boolean" },
     acpSessionId: { anyOf: [{ type: "string" }, { type: "null" }] },
     connected: { type: "boolean" },
     busy: { type: "boolean" },
@@ -41,7 +43,8 @@ const stateSchema = {
   required: [
     "sessionID",
     "mode",
-    "relayAllTools",
+    "codeModeEnabled",
+    "starting",
     "acpSessionId",
     "connected",
     "busy",
@@ -72,20 +75,30 @@ export const AcpRpc = Rpc.define({
       },
       output: stateSchema,
     },
-    setRelayAll: {
+    setCodeMode: {
       input: {
         type: "object",
         properties: {
           sessionID: { type: "string" },
-          relayAllTools: { type: "boolean" },
+          codeModeEnabled: { type: "boolean" },
         },
-        required: ["sessionID", "relayAllTools"],
+        required: ["sessionID", "codeModeEnabled"],
         additionalProperties: false,
       },
       output: stateSchema,
     },
     resetSession: {
       input: sessionIdSchema,
+      output: stateSchema,
+    },
+    warmSession: {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+        },
+        additionalProperties: false,
+      },
       output: stateSchema,
     },
     reloadModels: {
