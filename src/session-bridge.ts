@@ -92,7 +92,7 @@ interface ActiveTurn {
   openTextId?: string
   openReasoningId?: string
   partSeq: number
-  readonly activeNativeTools: Set<string>
+  readonly activeNativeTools: Map<string, string>
   readonly relayedUpdateIds: Set<string>
   readonly pendingMcpCalls: Map<string, PendingMcpCall>
   readonly dispatchedCallIds: Set<string>
@@ -1256,10 +1256,10 @@ export class SessionBridgeManager {
       const status = String(update.status ?? "")
       if (kind === "tool_call" && !turn.activeNativeTools.has(callId)) {
         this.closeOpenBlocks(turn)
-        turn.activeNativeTools.add(callId)
         const rawInput = update.rawInput ?? update.args ?? {}
         const jsonInput = JSON.stringify(rawInput)
         const displayName = `acp_${name}`
+        turn.activeNativeTools.set(callId, displayName)
         this.emitPart(turn, {
           type: "tool-input-start",
           id: callId,
@@ -1283,15 +1283,14 @@ export class SessionBridgeManager {
           providerExecuted: true,
           providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
         })
-        return
       }
 
       if (
         (status === "completed" || status === "failed" || status === "error" || status === "cancelled") &&
         turn.activeNativeTools.has(callId)
       ) {
+        const displayName = turn.activeNativeTools.get(callId) ?? `acp_${name}`
         turn.activeNativeTools.delete(callId)
-        const displayName = `acp_${name}`
         const isError = status !== "completed"
         const resultPayload = extractToolContentText(update)
         this.emitPart(turn, {
@@ -1315,18 +1314,18 @@ export class SessionBridgeManager {
     // Emit any remaining buffered native chunks, close open text/reasoning, emit finish:stop
     this.closeOpenBlocks(turn)
     if (turn.activeNativeTools.size > 0) {
-      for (const id of turn.activeNativeTools) {
-        this.emitPart(turn, {
-          type: "tool-result",
-          toolCallId: id,
-          toolName: "acp_tool",
-          result: { status: "completed" },
-          isError: false,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
-        })
-      }
-      turn.activeNativeTools.clear()
+    for (const [id, toolName] of turn.activeNativeTools) {
+      this.emitPart(turn, {
+        type: "tool-result",
+        toolCallId: id,
+        toolName,
+        result: { status: "completed" },
+        isError: false,
+        providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      })
     }
+    turn.activeNativeTools.clear()
+  }
 
     const stopReason = turn.promptResult?.stopReason
     const unified: LanguageModelV3FinishReason["unified"] =
@@ -1555,7 +1554,7 @@ export class SessionBridgeManager {
         const turn: ActiveTurn = {
           bufferedParts: [],
           partSeq: 0,
-          activeNativeTools: new Set(),
+          activeNativeTools: new Map(),
           relayedUpdateIds: new Set(),
           pendingMcpCalls: new Map(),
           dispatchedCallIds: new Set(),
