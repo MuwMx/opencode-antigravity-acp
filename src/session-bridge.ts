@@ -45,8 +45,6 @@ const NATIVE_SHADOWED_TOOLS = new Set([
   "edit",
   "multiedit",
   "apply_patch",
-  "bash",
-  "shell",
   "grep",
   "glob",
   "ls",
@@ -705,9 +703,10 @@ export class SessionBridgeManager {
     sections.push(
       [
         "<workspace_tools_bridge>",
-        "Additional workspace tools (including a JavaScript tool runner `mcp_oc_execute` and skill loader `mcp_oc_skill`) are attached to this session as MCP tools prefixed with `mcp_oc_`.",
-        "- When a task requires a tool from the catalog below, call `mcp_oc_execute` with JavaScript using `await tools.<server>.<tool>(...)`, or call the matching `mcp_oc_*` tool directly.",
-        "- Built-in file and shell tools remain available for normal workspace operations.",
+        "Additional workspace tools (including `mcp_oc_bash`, JavaScript tool runner `mcp_oc_execute`, and skill loader `mcp_oc_skill`) are attached to this session as MCP tools prefixed with `mcp_oc_`.",
+        "- Always use `mcp_oc_bash` (instead of built-in `run_command`) to run shell commands, builds, and tests so they execute synchronously until completion without background sleep.",
+        "- When a task requires another tool from the catalog below, call `mcp_oc_execute` with JavaScript using `await tools.<server>.<tool>(...)`, or call the matching `mcp_oc_*` tool directly.",
+        "- Built-in file tools remain available for normal workspace file operations.",
         "</workspace_tools_bridge>",
       ].join("\n"),
     )
